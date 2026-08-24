@@ -1,5 +1,6 @@
 # Home Assistant App: Example app
 
+
 _Example app to use as a blueprint for new apps._
 
 ![Supports aarch64 Architecture][aarch64-shield]
