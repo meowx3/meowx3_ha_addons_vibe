@@ -1,0 +1,319 @@
+#!/usr/bin/env python3
+"""Run GPSD, Chrony, and the read-only status dashboard."""
+
+import glob
+import json
+import logging
+import ctypes
+import signal
+import socket
+import subprocess
+import threading
+import time
+from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+
+logging.basicConfig(format="[gps_ntp] %(levelname)s: %(message)s", level=logging.INFO)
+LOG = logging.getLogger("gps_ntp")
+OPTIONS_FILE = Path("/data/options.json")
+HTML_FILE = Path("/usr/share/gps_ntp/index.html")
+
+state = {
+    "gps": {"device": None, "mode": 0, "time": None, "latitude": None, "longitude": None, "altitude": None},
+    "satellites": [],
+    "chrony": {"tracking": {}, "sources": [], "stats": {}},
+    "updated": None,
+}
+state_lock = threading.Lock()
+stop_event = threading.Event()
+children = []
+gps_shm = None
+
+
+class ShmTime(ctypes.Structure):
+    _fields_ = [
+        ("mode", ctypes.c_int),
+        ("count", ctypes.c_int),
+        ("clock_time", ctypes.c_double),
+        ("receive_time", ctypes.c_double),
+        ("leap", ctypes.c_int),
+        ("precision", ctypes.c_int),
+        ("samples", ctypes.c_int),
+        ("valid", ctypes.c_int),
+        ("clock_sec", ctypes.c_double),
+        ("clock_usec", ctypes.c_double),
+        ("receive_sec", ctypes.c_double),
+        ("receive_usec", ctypes.c_double),
+    ]
+
+
+def create_gps_shm():
+    libc = ctypes.CDLL(None)
+    libc.shmat.restype = ctypes.c_void_p
+    segment = libc.shmget(0x4, ctypes.sizeof(ShmTime), 0o666 | 0o1000)
+    if segment < 0:
+        LOG.warning("Unable to create Chrony GPS shared memory segment")
+        return None
+    address = libc.shmat(segment, None, 0)
+    if address == -1:
+        LOG.warning("Unable to attach Chrony GPS shared memory segment")
+        return None
+    return ctypes.cast(address, ctypes.POINTER(ShmTime))
+
+
+def publish_gps_time(value):
+    if gps_shm is None or not value:
+        return
+    try:
+        clock_time = datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return
+    receive_time = time.time()
+    sample = gps_shm.contents
+    sample.valid = 0
+    sample.clock_time = clock_time
+    sample.receive_time = receive_time
+    sample.clock_sec = int(clock_time)
+    sample.clock_usec = (clock_time % 1) * 1000000
+    sample.receive_sec = int(receive_time)
+    sample.receive_usec = (receive_time % 1) * 1000000
+    sample.leap = 0
+    sample.precision = -1
+    sample.samples = 3
+    sample.count += 1
+    sample.valid = 1
+
+
+def options():
+    try:
+        with OPTIONS_FILE.open(encoding="utf-8") as stream:
+            return json.load(stream)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def find_device(configured):
+    if configured:
+        return configured
+    by_id = sorted(glob.glob("/dev/serial/by-id/*"))
+    if by_id:
+        return by_id[0]
+    candidates = sorted(glob.glob("/dev/ttyACM*") + glob.glob("/dev/ttyUSB*"))
+    return candidates[0] if candidates else None
+
+
+def write_chrony_config(settings):
+    lines = [
+        "driftfile /var/lib/chrony/chrony.drift",
+        "makestep 1.0 3",
+        "rtcsync",
+        "refclock SHM 0 refid GPS stratum 1 precision 1e-1 trust prefer",
+        "allow 0.0.0.0/0",
+        "bindaddress 0.0.0.0",
+        "cmdallow 127.0.0.1",
+        "logdir /var/log/chrony",
+    ]
+    if settings.get("ntp_pool", True):
+        for pool in settings.get("pool_servers", ["pool.ntp.org"]):
+            if str(pool).strip():
+                lines.append(f"pool {str(pool).strip()} iburst maxsources 4")
+    Path("/run/chrony.conf").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def start_process(command):
+    LOG.info("Starting %s", " ".join(command))
+    process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+    children.append(process)
+    return process
+
+
+def gps_reader():
+    while not stop_event.is_set():
+        try:
+            connection = socket.create_connection(("127.0.0.1", 2947), timeout=5)
+            connection.sendall(b'?WATCH={"enable":true,"json":true,"scaled":true}\n')
+            connection.settimeout(2)
+            buffer = b""
+            while not stop_event.is_set():
+                try:
+                    chunk = connection.recv(4096)
+                except socket.timeout:
+                    continue
+                if not chunk:
+                    break
+                buffer += chunk
+                while b"\n" in buffer:
+                    raw, buffer = buffer.split(b"\n", 1)
+                    try:
+                        message = json.loads(raw.decode("utf-8"))
+                    except (UnicodeDecodeError, json.JSONDecodeError):
+                        continue
+                    update_gps(message)
+            connection.close()
+        except OSError:
+            time.sleep(2)
+
+
+def update_gps(message):
+    message_type = message.get("class")
+    with state_lock:
+        state["updated"] = time.time()
+        if message_type == "TPV":
+            gps = state["gps"]
+            gps["mode"] = message.get("mode", gps["mode"])
+            for key in ("time", "lat", "lon", "alt"):
+                if key in message:
+                    gps[{"lat": "latitude", "lon": "longitude", "alt": "altitude"}.get(key, key)] = message[key]
+            publish_gps_time(message.get("time"))
+        elif message_type == "SKY":
+            state["satellites"] = [
+                {
+                    "id": satellite.get("PRN", satellite.get("svid")),
+                    "azimuth": satellite.get("az", 0),
+                    "elevation": satellite.get("el", 0),
+                    "signal": satellite.get("ss"),
+                    "used": bool(satellite.get("used")),
+                    "constellation": satellite.get("gnss", "GNSS"),
+                }
+                for satellite in message.get("satellites", [])
+                if satellite.get("az") is not None and satellite.get("el") is not None
+            ]
+
+
+def chrony_reader():
+    while not stop_event.is_set():
+        tracking = run_chronyc("tracking")
+        sources = run_chronyc("sources -n")
+        sourcestats = run_chronyc("sourcestats -n")
+        with state_lock:
+            state["chrony"] = {
+                "tracking": parse_tracking(tracking),
+                "sources": parse_sources(sources),
+                "stats": parse_sourcestats(sourcestats),
+            }
+        stop_event.wait(5)
+
+
+def run_chronyc(command):
+    try:
+        return subprocess.run(["chronyc", *command.split()], capture_output=True, text=True, timeout=3).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def parse_tracking(output):
+    result = {}
+    for line in output.splitlines():
+        if ":" in line:
+            key, value = line.split(":", 1)
+            result[key.strip()] = value.strip()
+    return result
+
+
+def parse_sources(output):
+    sources = []
+    for line in output.splitlines():
+        if not line or line.startswith(("MS", "=")):
+            continue
+        fields = line.split()
+        if len(fields) >= 8:
+            marker = fields[0]
+            sources.append({"mode": marker[0], "state": marker[1:], "name": fields[1], "stratum": fields[2], "poll": fields[3], "reach": fields[5], "last_sample": fields[6]})
+    return sources
+
+
+def parse_sourcestats(output):
+    stats = []
+    for line in output.splitlines():
+        if not line or line.startswith(("Name", "=", "#")):
+            continue
+        fields = line.split()
+        if len(fields) >= 8:
+            stats.append({"name": fields[0], "samples": fields[1], "runs": fields[2], "span": fields[3], "offset": fields[4], "error": fields[7]})
+    return stats
+
+
+def snapshot():
+    with state_lock:
+        result = json.loads(json.dumps(state))
+    result["device"] = result["gps"]["device"]
+    result["satellites_total"] = len(result["satellites"])
+    result["satellites_used"] = sum(1 for satellite in result["satellites"] if satellite["used"])
+    result["obstruction_sectors"] = obstruction_sectors(result["satellites"])
+    return result
+
+
+def obstruction_sectors(satellites):
+    """Flag empty 30-degree azimuth sectors next to tracked satellites.
+
+    This is a visibility heuristic, not a radio-interference measurement.
+    """
+    bins = [0] * 12
+    for satellite in satellites:
+        if satellite["elevation"] >= 10:
+            bins[int(satellite["azimuth"] // 30) % 12] += 1
+    return [index * 30 for index, count in enumerate(bins) if count == 0 and sum(bins) >= 4]
+
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):  # noqa: N802
+        if self.path == "/api/status":
+            payload = json.dumps(snapshot()).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-store")
+        elif self.path in ("/", "/index.html"):
+            payload = HTML_FILE.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+        else:
+            self.send_error(404)
+            return
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, format_string, *args):
+        return
+
+
+def shutdown(*_):
+    stop_event.set()
+    for process in children:
+        if process.poll() is None:
+            process.terminate()
+
+
+def main():
+    global gps_shm
+    settings = options()
+    device = find_device(str(settings.get("gps_device", "")).strip())
+    state["gps"]["device"] = device or "No serial device detected"
+    write_chrony_config(settings)
+    gps_shm = create_gps_shm()
+    gps_command = ["gpsd", "-N", "-n", "-F", "/run/gpsd.sock"]
+    if device:
+        gps_command.append(device)
+    else:
+        LOG.warning("No GPS device detected; waiting for GPSD data")
+    start_process(gps_command)
+    start_process(["chronyd", "-n", "-f", "/run/chrony.conf"])
+    threading.Thread(target=gps_reader, daemon=True).start()
+    threading.Thread(target=chrony_reader, daemon=True).start()
+    server = ThreadingHTTPServer(("0.0.0.0", 8099), Handler)
+    signal.signal(signal.SIGTERM, shutdown)
+    signal.signal(signal.SIGINT, shutdown)
+    LOG.info("Dashboard listening on port 8099")
+    try:
+        server.serve_forever()
+    finally:
+        server.server_close()
+        shutdown()
+        for process in children:
+            process.wait(timeout=5)
+
+
+if __name__ == "__main__":
+    main()

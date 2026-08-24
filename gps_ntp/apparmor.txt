@@ -1,0 +1,31 @@
+#include <tunables/global>
+
+profile gps_ntp flags=(attach_disconnected,mediate_deleted) {
+  #include <abstractions/base>
+
+  file,
+  network,
+  capability,
+  signal (send,receive) set=(kill,term,int,hup,cont),
+
+  /init ix,
+  /bin/** ix,
+  /usr/bin/** ix,
+  /usr/sbin/** ix,
+  /run/{s6,s6-rc*,service}/** ix,
+  /package/** ix,
+  /command/** ix,
+  /etc/services.d/** rwix,
+  /etc/cont-init.d/** rwix,
+  /etc/cont-finish.d/** rwix,
+  /run/{,**} rwk,
+  /var/{lib,log}/chrony/** rw,
+  /data/** rw,
+  /share/** rw,
+  /dev/tty rw,
+  /dev/ttyACM* rw,
+  /dev/ttyUSB* rw,
+  /dev/serial/by-id/** r,
+  /usr/lib/bashio/** ix,
+  /tmp/** rwk,
+}

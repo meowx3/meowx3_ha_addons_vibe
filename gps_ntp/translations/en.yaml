@@ -1,0 +1,10 @@
+configuration:
+  gps_device:
+    name: GPS device path
+    description: Optional serial device path. Leave blank to auto-detect a USB GNSS receiver.
+  ntp_pool:
+    name: Use Internet NTP pool
+    description: Use the configured Internet NTP pool servers as fallback sources.
+  pool_servers:
+    name: NTP pool servers
+    description: DNS names of Internet NTP pool servers to use when enabled.
