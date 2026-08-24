@@ -1,7 +1,7 @@
 name: GPS NTP Server
 version: "1.0.0"
 slug: gps_ntp
-description: USB GNSS receiver and Chrony NTP server with satellite sky view
+description: Vibecoded USB GNSS receiver and Chrony NTP server with satellite sky view
 url: "https://github.com/meowx3/meowx3_ha_addons_vibe/tree/main/gps_ntp"
 arch:
   - aarch64
